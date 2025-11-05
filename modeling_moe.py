@@ -334,7 +334,7 @@ def batch_aware_top_p_router_vectorized(probs: torch.Tensor,
     weights_out = torch.zeros_like(probs)                                   # (B, S, E)
     indices_out = torch.full_like(sorted_idx, -1)                           # (B, S, E)
 
-    rng = torch.arange(E, device=device).view(1, 1, E)                      # for prefix masks
+    rng = torch.arange(E, device=device)                     # for prefix masks
 
     for s in range(S):
         vals = sorted_vals[:, s, :]     # (B, E)
@@ -358,7 +358,7 @@ def batch_aware_top_p_router_vectorized(probs: torch.Tensor,
         budget = min(budget, pool)
 
         # Allowed candidates mask: per token, only the first 'wants[b]' experts are eligible
-        allowed = rng < wants.view(B, 1)                                   # (B, E) bool
+        allowed = rng.unsqueeze(0) < wants.view(B, 1)                             # (B, E) bool
 
         # Global top-m selection across the allowed pool
         # Fill disallowed with -inf so they never get chosen
