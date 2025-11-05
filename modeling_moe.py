@@ -307,94 +307,92 @@ def batch_aware_top_p_router(probs: torch.Tensor,
 
     return weights_out, indices_out
 
-def batch_aware_top_p_router_vectorized(probs: torch.Tensor,
-                             top_p: float,
-                             per_step_total: torch.Tensor,
-                             fraction_of_experts_to_use: float):
+def batch_aware_top_p_router_vectorized(
+    probs: torch.Tensor,
+    top_p: float,
+    per_step_total: torch.Tensor,
+    fraction_of_experts_to_use: float,
+):
     """
-    Vectorized batch-aware top-p routing.
-
-    Args:
-        probs: (B, S, E) softmaxed probs over experts per token.
-        top_p: cumulative mass target per token.
-        per_step_total: (S,) int tensor, number of expert assignments requested by a baseline router per step.
-        fraction_of_experts_to_use: float in (0, 1], global fraction of per-step requested assignments to actually allocate.
+    Vectorized batch-aware top-p routing (B, S, E).
 
     Returns:
-        weights_out: (B, S, E) renormalized weights over *selected* experts (0 elsewhere).
-        indices_out: (B, S, E) expert ids where weight>0, -1 elsewhere (same shape contract as your code).
+        weights_out: (B, S, E) renormalized weights over selected experts; 0 elsewhere.
+        indices_out: (B, S, E) expert ids where weight>0; -1 elsewhere.
     """
     assert probs.dim() == 3, "probs must be (B, S, E)"
     B, S, E = probs.shape
     device, dtype = probs.device, probs.dtype
 
-    # Sort experts per token descending (vectorized)
+    # Sort per token
     sorted_vals, sorted_idx = torch.sort(probs, dim=-1, descending=True)   # (B, S, E)
 
     weights_out = torch.zeros_like(probs)                                   # (B, S, E)
     indices_out = torch.full_like(sorted_idx, -1)                           # (B, S, E)
 
-    rng = torch.arange(E, device=device)                     # for prefix masks
+    rng_E = torch.arange(E, device=device)                                  # (E,)
+    arangeE_expand = torch.arange(E, device=device).expand(B, E)            # (B, E)
+
+    if not isinstance(per_step_total, torch.Tensor):
+        per_step_total = torch.tensor(per_step_total, device=device)
+    per_step_total = per_step_total.to(device)
 
     for s in range(S):
         vals = sorted_vals[:, s, :]     # (B, E)
         idxs = sorted_idx[:, s, :]      # (B, E)
 
-        # How many experts each token "wants": the smallest k with cumsum >= top_p.
-        # Handle edge cases robustly.
-        csum = vals.cumsum(dim=-1)                                        # (B, E)
-        wants = (csum < top_p).sum(dim=-1) + 1                            # (B,)
-        # If top_p==0: wants==1; clamp to [0, E]
-        wants = wants.clamp(min=0, max=E)
+        # Per-token wants: smallest k with cumsum >= top_p
+        csum  = vals.cumsum(dim=-1)                     # (B, E)
+        wants = (csum < top_p).sum(dim=-1) + 1          # (B,)
+        wants = wants.clamp_(min=0, max=E)
 
-        # Budget for this step: a fraction of the requested total
+        # Per-step budget
         req_total = int(per_step_total[s].item())
-        budget = int(round(req_total * float(fraction_of_experts_to_use)))
-        # Can't allocate more than the pool allows
+        budget    = int(round(req_total * float(fraction_of_experts_to_use)))
+
         pool = int(wants.sum().item())
         if pool == 0 or budget <= 0:
-            # leave outputs zero/-1 for this step
             continue
         budget = min(budget, pool)
 
-        # Allowed candidates mask: per token, only the first 'wants[b]' experts are eligible
-        allowed = rng.unsqueeze(0) < wants.view(B, 1)                             # (B, E) bool
+        # Allowed = first wants[b] experts per token
+        allowed = (rng_E.unsqueeze(0) < wants.view(B, 1))   # (B, E) bool
 
-        # Global top-m selection across the allowed pool
-        # Fill disallowed with -inf so they never get chosen
-        allowed_vals = vals.masked_fill(~allowed, float("-inf"))           # (B, E)
-        flat = allowed_vals.flatten()                                      # (B*E,)
-        top_vals, top_pos = torch.topk(flat, k=budget, dim=0)              # (m,)
-        # Build a boolean selection mask in sorted-space
-        selected_sorted = torch.zeros_like(allowed, dtype=torch.bool)      # (B, E)
+        # Global top-`budget` across allowed
+        allowed_vals = vals.masked_fill(~allowed, float("-inf"))  # (B, E)
+        flat = allowed_vals.reshape(-1)                            # (B*E,)
+        _, top_pos = torch.topk(flat, k=budget, dim=0)            # (budget,)
+
+        # Boolean selection in sorted-space
+        selected_sorted = torch.zeros_like(allowed, dtype=torch.bool)   # (B, E)
         selected_sorted.view(-1)[top_pos] = True
 
-        # (Optional) tie-break: if there are exact ties at the boundary and you want strict <= budget, topk already returns exactly 'budget' items.
-
-        # Gather selected probs, renormalize per token
+        # Renormalize per token
         kept_vals = torch.where(selected_sorted, vals, torch.zeros_like(vals))  # (B, E)
-        denom = kept_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)             # (B, 1)
+        denom     = kept_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)         # (B, 1)
         kept_norm = kept_vals / denom
-        # zero rows (tokens with 0 selected) stay 0 automatically
 
-        # Map back to original expert ids for this step
-        # First compute indices per position, then scatter weights to original expert dimension
-        w = torch.zeros((B, E), device=device, dtype=dtype)
-        # Only place where selected
-        valid = selected_sorted
-        if valid.any():
-            # idxs: original expert ids at each sorted position
-            src = kept_norm[valid]
-            dst_idx = idxs[valid]
-            # We need an index-per-row scatter; do a batched scatter via advanced indexing
-            rows = torch.arange(B, device=device).unsqueeze(1).expand(B, E)[valid]
-            w.index_put_((rows, dst_idx), src, accumulate=False)
+        # ---- SAFE GATHER & SCATTER (no boolean indexing on idxs) ----
+        # coordinates of selected entries in sorted-space
+        rc = selected_sorted.nonzero(as_tuple=False)        # (M, 2) with columns [row, col]
+        if rc.numel() > 0:
+            rows = rc[:, 0].long()                          # (M,)
+            cols = rc[:, 1].long()                          # (M,)
+
+            src     = kept_norm[rows, cols]                 # (M,)
+            dst_idx = idxs[rows, cols].long()               # (M,) original expert ids in [0, E)
+
+            # scatter into (B, E) via linear indices
+            w = torch.zeros((B, E), device=device, dtype=dtype)
+            lin = rows * E + dst_idx                        # (M,)
+            w.view(-1)[lin] = src
+        else:
+            w = torch.zeros((B, E), device=device, dtype=dtype)
 
         weights_out[:, s, :] = w
-        # Fill indices_out with original ids where weight > 0, else -1
         indices_out[:, s, :] = torch.where(
             w > 0,
-            torch.arange(E, device=device).expand(B, E),
+            arangeE_expand,
             torch.full_like(idxs, -1),
         )
 
